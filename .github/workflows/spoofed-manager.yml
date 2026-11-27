@@ -35,6 +35,14 @@ jobs:
           git checkout -f "$REF"
           echo "HEAD = $(git describe --tags --always)"
 
+      # 上游 kptools 源仓库改名了（ShirkNeko/SukiSU_patch -> SukiSU-Nova/SukiSU_patch），
+      # 老 URL 现在 404，会让 :app:downloadKpmTools 失败。这里在 checkout 之后改回来。
+      - name: Fix moved kptools source
+        working-directory: manager
+        run: |
+          sed -i "s|raw.githubusercontent.com/ShirkNeko/SukiSU_patch|raw.githubusercontent.com/SukiSU-Nova/SukiSU_patch|" app/build.gradle.kts
+          grep -n "SukiSU_patch" app/build.gradle.kts
+
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
