@@ -1,0 +1,173 @@
+name: Build spoofed manager (SukiSU Nova)
+
+# 用法：fork 本仓库 -> Actions -> 左侧 "Build spoofed manager" -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "上游 tag（保持 v3.0.0 = 与你平板上已装的 LKM 对齐）"
+        required: false
+        default: "v3.0.0"
+      package_name:
+        description: "指定包名，如 com.mintyx.labs；留空 = 随机生成"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pin upstream ref
+        run: |
+          set -e
+          REF="${{ inputs.upstream_ref }}"
+          git fetch --tags --depth=1 origin "refs/tags/${REF}:refs/tags/${REF}" || git fetch --depth=1 origin "$REF"
+          git checkout -f "$REF"
+          echo "HEAD = $(git describe --tags --always)"
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # 装上仓库要求的确切版本，别指望 runner 镜像自带
+      - name: Install Android SDK components
+        run: |
+          set -e
+          SDKMGR="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMGR" ] || SDKMGR="$(find ${ANDROID_HOME} -name sdkmanager -type f | head -1)"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" --install "platform-tools" "platforms;android-37.0" \
+            "build-tools;37.0.0" "ndk;29.0.14206865" "cmake;3.22.1" 2>&1 | tail -5
+
+      # 1) 随机包名（等价于上游 manager/randomizer）
+      - name: Randomize package name
+        working-directory: manager
+        run: |
+          set -e
+          if [ -n "${{ inputs.package_name }}" ]; then
+            w1=$(echo "${{ inputs.package_name }}" | cut -d. -f1)
+            w2=$(echo "${{ inputs.package_name }}" | cut -d. -f2)
+            w3=$(echo "${{ inputs.package_name }}" | cut -d. -f3)
+            w4=$(tr -dc 'a-z' </dev/urandom | head -c6)
+          else
+            w1=$(tr -dc 'a-z' </dev/urandom | head -c6); w2=$(tr -dc 'a-z' </dev/urandom | head -c6)
+            w3=$(tr -dc 'a-z' </dev/urandom | head -c6); w4=$(tr -dc 'a-z' </dev/urandom | head -c6)
+          fi
+          echo "NEWPKG=${w1}.${w2}.${w3}" >> "$GITHUB_ENV"
+          export w1 w2 w3 w4
+          find . -depth -type d -name 'com'    -execdir mv {} "$w1" \;
+          find . -depth -type d -name 'sukisu' -execdir mv {} "$w2" \;
+          find . -depth -type d -name 'nova'   -execdir mv {} "$w3" \;
+          find . -depth -type d -name 'io'     -execdir mv {} "$w4" \;
+          find . -type f -exec sed -i \
+            -e "s/com\.sukisu\.nova/$w1.$w2.$w3/g" \
+            -e "s/io\.sukisu\.nova/$w4.$w2.$w3/g" \
+            -e "s/com\.sukisu\.zako/$w1.$w2.zako/g" \
+            -e "s/com\/sukisu\/nova/$w1\/$w2\/$w3/g" \
+            -e "s/io\/sukisu\/nova/$w4\/$w2\/$w3/g" \
+            -e "s/io_sukisu_nova/${w4}_${w2}_${w3}/g" \
+            -e "s/com_sukisu_nova/${w1}_${w2}_${w3}/g" {} +
+          sed -i -e '/fun getGitDescribe(): String {/,/^    }/ s/\.trim()$/.trim() + "-spoofed"/' build.gradle.kts
+          echo "package -> ${w1}.${w2}.${w3}"
+
+      # 2) 打掉检测方用的固定锚点：libksud.so / cmake target / 组件类名
+      - name: Randomize identities
+        working-directory: manager
+        run: |
+          set -e
+          ra() { tr -dc 'a-z' </dev/urandom | head -c "$1"; }
+          KSUD_LIB="lib$(ra 10).so"; CORE_LIB="$(ra 11)"
+          APP_CLASS="$(ra 11)"; PRE="$(ra 11)"; MAIN="$(ra 11)"
+          WEB="$(ra 11)"; DL="$(ra 11)"; MAG="$(ra 11)"
+          find app/src/main -type f \
+            \( -name '*.kt' -o -name '*.java' -o -name '*.xml' -o -name '*.cc' -o -name 'CMakeLists.txt' \) \
+            -exec sed -i \
+              -e "s/\"libksud\.so\"/\"$KSUD_LIB\"/g" \
+              -e "s/project(\"kernelsu\")/project(\"$CORE_LIB\")/" \
+              -e "s/add_library(kernelsu/add_library($CORE_LIB/" \
+              -e "s/target_include_directories(kernelsu /target_include_directories($CORE_LIB /" \
+              -e "s/target_link_libraries(kernelsu /target_link_libraries($CORE_LIB /" \
+              -e "s/loadLibrary(\"kernelsu\")/loadLibrary(\"$CORE_LIB\")/g" \
+              -e "/^[[:space:]]*[*\/]/!s/KernelSUApplication/${APP_CLASS}Application/g" \
+              -e "/^[[:space:]]*[*\/]/!s/AppZygotePreload/${PRE}Preload/g" \
+              -e "/^[[:space:]]*[*\/]/!s/MainActivity/${MAIN}Activity/g" \
+              -e "/^[[:space:]]*[*\/]/!s/WebUIActivity/${WEB}Activity/g" \
+              -e "/^[[:space:]]*[*\/]/!s/DownloadService/${DL}Service/g" \
+              -e "/^[[:space:]]*[*\/]/!s/MagicaService/${MAG}Service/g" {} +
+          mv_f() { [ -n "$1" ] && find app/src/main -depth -type f -name "$1" -execdir mv {} "$2" \; || true; }
+          mv_f KernelSUApplication.kt "${APP_CLASS}Application.kt"
+          mv_f AppZygotePreload.java  "${PRE}Preload.java"
+          mv_f MainActivity.kt        "${MAIN}Activity.kt"
+          mv_f MainActivityUiState.kt "${MAIN}ActivityUiState.kt"
+          mv_f MainActivityViewModel.kt "${MAIN}ActivityViewModel.kt"
+          mv_f WebUIActivity.kt       "${WEB}Activity.kt"
+          mv_f DownloadService.kt     "${DL}Service.kt"
+          mv_f MagicaService.java     "${MAG}Service.java"
+          echo "KSUD_LIB=$KSUD_LIB" >> "$GITHUB_ENV"
+          echo "identities: $KSUD_LIB / lib$CORE_LIB.so / ${APP_CLASS}Application"
+
+      # 3) 删掉 ksu:// 与 sukisu-theme:// 的 intent-filter（intent-profile 的锚点）
+      - name: Strip detectable intent filters
+        working-directory: manager
+        run: |
+          perl -0777 -i -pe 's{<intent-filter>(?:(?!</intent-filter>).)*?(?:android:scheme="ksu"|android:scheme="sukisu-theme")(?:(?!</intent-filter>).)*?</intent-filter>}{}gs' app/src/main/AndroidManifest.xml
+          echo "剩余 ksu scheme 数量: $(grep -c 'android:scheme="ksu"' app/src/main/AndroidManifest.xml || true)"
+
+      # 4) 官方 ksud（省掉 Rust 交叉编译）
+      - name: Fetch ksud
+        run: |
+          set -e
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          curl -fL --retry 3 -o /tmp/ksud \
+            "https://github.com/SukiSU-Nova/SukiSU-Nova/releases/download/${{ inputs.upstream_ref }}/ksud-aarch64-linux-android"
+          cp -f /tmp/ksud "manager/app/src/main/jniLibs/arm64-v8a/${KSUD_LIB}"
+          ls -l manager/app/src/main/jniLibs/arm64-v8a/
+
+      # 5) 现场生成签名密钥
+      - name: Prepare keystore
+        working-directory: manager
+        run: |
+          set -e
+          keytool -genkeypair -v -keystore key.jks -alias mykey -keyalg RSA -keysize 4096 \
+            -validity 10000 -storepass android -keypass android \
+            -dname "CN=Android, OU=Android, O=Android, L=Android, ST=Android, C=US"
+          printf "%s\n" "KEYSTORE_FILE='key.jks'" "KEYSTORE_PASSWORD='android'" "KEY_ALIAS='mykey'" "KEY_PASSWORD='android'" >> gradle.properties
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        working-directory: manager
+        run: ./gradlew --no-daemon assembleRelease -PKSU_PACKAGE_NAME="$NEWPKG"
+
+      - name: Report
+        run: |
+          set -e
+          APK=$(ls -1 manager/app/build/outputs/apk/release/*.apk | head -1)
+          sha256sum "$APK"
+          "$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$APK" | head -2 || true
+          {
+            echo "### 构建成功"
+            echo "- 包名: \`$NEWPKG\`"
+            echo "- 文件: \`$(basename $APK)\`"
+            echo "- sha256: \`$(sha256sum "$APK" | cut -d' ' -f1)\`"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: spoofed-manager-apk
+          path: manager/app/build/outputs/apk/release/*.apk
+          retention-days: 14
